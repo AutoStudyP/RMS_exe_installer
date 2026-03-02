@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "snr-meter"
+version = "0.0.0"
+description = "Desktop SNR (Signal-to-Noise Ratio) analyzer with 2-stage microphone recording and real-time visualization"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.8"
+authors = [
+    { name = "AutoStudyP", email = "autostudyp@github.com" }
+]
+keywords = ["snr", "audio", "signal-to-noise", "microphone", "pyqt5", "noise-measurement"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Multimedia :: Sound/Audio :: Analysis",
+    "Topic :: Scientific/Engineering :: Visualization",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "PyQt5>=5.15.0",
+    "sounddevice>=0.4.6",
+    "numpy>=1.21.0",
+]
+
+[project.optional-dependencies]
+build = [
+    "pyinstaller>=5.0.0",
+]
+dev = [
+    "pyinstaller>=5.0.0",
+    "build>=1.0.0",
+    "twine>=4.0.0",
+]
+
+[project.scripts]
+snr-meter = "snr_meter.main_window:main"
+
+[project.urls]
+Homepage = "https://github.com/AutoStudyP/RMS_exe_installer"
+Repository = "https://github.com/AutoStudyP/RMS_exe_installer"
+"Bug Tracker" = "https://github.com/AutoStudyP/RMS_exe_installer/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["snr_meter*"]
+
+[tool.setuptools.package-data]
+snr_meter = ["assets/*"]
