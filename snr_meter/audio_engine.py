@@ -1,5 +1,11 @@
 """
 Audio Engine - Recording and SNR Calculation Module
+
+Includes:
+  AudioRecorder     — manual 2-stage recorder
+  AutoVADRecorder   — single-pass recorder that auto-classifies
+                      speech (Signal) vs silence (Noise) frames
+                      using short-time RMS energy gating.
 """
 
 import numpy as np
@@ -207,3 +213,182 @@ class AudioRecorder:
             padded = np.zeros(n_samples, dtype=DTYPE)
             padded[-len(all_data) :] = all_data
             return padded
+
+
+# ──────────────────────────────────────────────
+#  Auto VAD Recorder
+# ──────────────────────────────────────────────
+class AutoVADRecorder:
+    """
+    Single-pass recorder that automatically separates
+    speech/signal frames from background-noise frames
+    using a short-time RMS energy threshold.
+
+    Algorithm
+    ---------
+    * Blocksize = 1024 samples (~23 ms @ 44100 Hz)
+    * For every block, compute RMS energy.
+    * Maintain a rolling baseline (median of quiet blocks)
+      that adapts to the room over time.
+    * If block_rms > baseline * SPEECH_RATIO  → signal frame
+    * Else                                    → noise frame
+    * SNR is re-computed every UPDATE_INTERVAL signal+noise frames.
+    """
+
+    SPEECH_RATIO   = 3.0   # block must be 3× louder than baseline to count as signal
+    BLOCKSIZE      = 1024
+    UPDATE_INTERVAL = 20   # recompute SNR every N new frames total
+    BASELINE_WINDOW = 80   # rolling window (frames) for noise floor estimation
+
+    def __init__(self, sample_rate: int = SAMPLE_RATE,
+                 on_snr_update: Optional[Callable[['SNRResult', np.ndarray, np.ndarray], None]] = None,
+                 on_chunk: Optional[Callable[[np.ndarray, bool], None]] = None):
+        self.sample_rate = sample_rate
+        self.on_snr_update = on_snr_update   # callback(SNRResult, signal_frames, noise_frames)
+        self.on_chunk = on_chunk              # callback(chunk, is_signal: bool)
+
+        self._signal_frames: List[np.ndarray] = []
+        self._noise_frames:  List[np.ndarray] = []
+        self._rms_history:   List[float] = []   # rolling RMS of all blocks
+        self._frame_counter  = 0
+        self._is_running     = False
+        self._lock           = threading.Lock()
+        self._stream: Optional[sd.InputStream] = None
+        self.last_snr: Optional[SNRResult] = None
+        self.last_block_is_signal = False
+        self._last_raw: np.ndarray = np.zeros(self.BLOCKSIZE, dtype=DTYPE)
+
+    # ── public API ──────────────────────────────────────────────────────
+    @property
+    def is_running(self) -> bool:
+        return self._is_running
+
+    def start(self, device_index: Optional[int] = None):
+        if self._is_running:
+            return
+        with self._lock:
+            self._signal_frames.clear()
+            self._noise_frames.clear()
+            self._rms_history.clear()
+            self._frame_counter = 0
+            self._is_running = True
+            self.last_snr = None
+
+        self._stream = sd.InputStream(
+            samplerate=self.sample_rate,
+            channels=CHANNELS,
+            dtype=DTYPE,
+            device=device_index,
+            callback=self._audio_callback,
+            blocksize=self.BLOCKSIZE,
+        )
+        self._stream.start()
+
+    def stop(self):
+        self._is_running = False
+        if self._stream:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
+
+    def reset(self):
+        """Clear accumulated frames without stopping."""
+        with self._lock:
+            self._signal_frames.clear()
+            self._noise_frames.clear()
+            self._rms_history.clear()
+            self._frame_counter = 0
+            self.last_snr = None
+
+    def get_frame_counts(self) -> tuple:
+        """Returns (n_signal_frames, n_noise_frames)"""
+        with self._lock:
+            return len(self._signal_frames), len(self._noise_frames)
+
+    def get_signal_duration(self) -> float:
+        with self._lock:
+            return len(self._signal_frames) * self.BLOCKSIZE / self.sample_rate
+
+    def get_noise_duration(self) -> float:
+        with self._lock:
+            return len(self._noise_frames) * self.BLOCKSIZE / self.sample_rate
+
+    def get_live_level(self) -> float:
+        """Latest RMS 0..1 for VU meter."""
+        with self._lock:
+            if not self._rms_history:
+                return 0.0
+            return min(self._rms_history[-1] * 10, 1.0)
+
+    def get_live_waveform(self, n_samples: int = 2048) -> np.ndarray:
+        """Most recent n_samples of raw audio for waveform display."""
+        with self._lock:
+            all_frames = self._signal_frames + self._noise_frames
+            if not all_frames:
+                return np.zeros(n_samples, dtype=DTYPE)
+            # use last frames sorted by order — we keep insertion order separately
+            raw = self._last_raw
+        if len(raw) >= n_samples:
+            return raw[-n_samples:]
+        out = np.zeros(n_samples, dtype=DTYPE)
+        out[-len(raw):] = raw
+        return out
+
+    # ── internal ────────────────────────────────────────────────────────
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+
+    def _audio_callback(self, indata, frames, time_info, status):
+        if not self._is_running:
+            return
+        chunk = indata[:, 0].copy()
+        rms = float(np.sqrt(np.mean(chunk ** 2)))
+
+        with self._lock:
+            self._rms_history.append(rms)
+            if len(self._rms_history) > self.BASELINE_WINDOW:
+                self._rms_history.pop(0)
+
+            # Adaptive noise floor: median of the quietest 50% of recent blocks
+            if len(self._rms_history) >= 4:
+                sorted_rms = sorted(self._rms_history)
+                baseline = float(np.median(sorted_rms[: len(sorted_rms) // 2 + 1]))
+            else:
+                baseline = rms  # not enough history yet
+
+            threshold = max(baseline * self.SPEECH_RATIO, 1e-4)
+            is_signal = rms > threshold
+            self.last_block_is_signal = is_signal
+            self._last_raw = chunk   # store latest chunk for waveform
+
+            if is_signal:
+                self._signal_frames.append(chunk)
+            else:
+                self._noise_frames.append(chunk)
+
+            self._frame_counter += 1
+            should_update = (
+                self._frame_counter % self.UPDATE_INTERVAL == 0
+                and len(self._signal_frames) >= 4
+                and len(self._noise_frames) >= 4
+            )
+
+            if should_update:
+                sig = np.concatenate(self._signal_frames).astype(DTYPE)
+                noi = np.concatenate(self._noise_frames).astype(DTYPE)
+                signal_data = AudioData(sig, self.sample_rate, 'signal')
+                noise_data  = AudioData(noi, self.sample_rate, 'noise')
+                result = SNRResult(signal=signal_data, noise=noise_data)
+                self.last_snr = result
+                sig_snap = sig.copy()
+                noi_snap = noi.copy()
+            else:
+                result = None
+                sig_snap = None
+                noi_snap = None
+
+        # fire callbacks outside the lock
+        if self.on_chunk:
+            self.on_chunk(chunk, is_signal)
+        if result and self.on_snr_update:
+            self.on_snr_update(result, sig_snap, noi_snap)  # type: ignore
