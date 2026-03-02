@@ -467,3 +467,173 @@ class VUMeterWidget(QWidget):
         painter.drawRect(0, 0, w - 1, h - 1)
 
         painter.end()
+
+
+# ──────────────────────────────────────────────
+#  Live SNR History Graph
+# ──────────────────────────────────────────────
+class LiveSNRHistoryWidget(QWidget):
+    """
+    Scrolling line graph of SNR (dB) over time.
+    Points are added via push_snr(); the last MAX_POINTS are kept.
+    Also shows a colour-coded quality band in the background.
+    """
+
+    MAX_POINTS = 120  # ~2 min at one update per second
+    DB_MIN, DB_MAX = -10, 60
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._history: list = []   # list of float (dB values)
+        self.setMinimumSize(300, 120)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def push_snr(self, snr_db: float):
+        self._history.append(snr_db)
+        if len(self._history) > self.MAX_POINTS:
+            self._history.pop(0)
+        self.update()
+
+    def clear(self):
+        self._history.clear()
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+
+        painter.fillRect(0, 0, w, h, BG_WIDGET)
+
+        pad_l, pad_r, pad_t, pad_b = 42, 8, 8, 20
+        pw = w - pad_l - pad_r
+        ph = h - pad_t - pad_b
+
+        def db_to_y(db):
+            t = (db - self.DB_MIN) / (self.DB_MAX - self.DB_MIN)
+            return pad_t + ph * (1.0 - t)
+
+        # Quality band backgrounds
+        bands = [
+            (40, 60,  '#00E676', 15),   # Excellent
+            (25, 40,  '#3FB950', 15),   # Good
+            (15, 25,  '#E3B341', 15),   # Acceptable
+            ( 5, 15,  '#FF9800', 15),   # Poor
+            (-10, 5,  '#F44336', 15),   # Very Poor
+        ]
+        for lo, hi, color, alpha in bands:
+            y_hi = db_to_y(hi)
+            y_lo = db_to_y(lo)
+            c = QColor(color)
+            c.setAlpha(alpha)
+            painter.fillRect(int(pad_l), int(y_hi), int(pw), int(y_lo - y_hi), c)
+
+        # Grid lines + Y labels
+        painter.setFont(QFont('Consolas', 7))
+        for db in range(-10, 61, 10):
+            y = db_to_y(db)
+            painter.setPen(QPen(GRID_COLOR, 1, Qt.DotLine))
+            painter.drawLine(pad_l, int(y), pad_l + pw, int(y))
+            painter.setPen(TEXT_MUTED)
+            painter.drawText(2, int(y) + 4, f'{db}')
+
+        # X-axis label
+        painter.setPen(TEXT_MUTED)
+        painter.setFont(QFont('Consolas', 7))
+        painter.drawText(pad_l, h - 2, 'older')
+        painter.drawText(w - 32, h - 2, 'now')
+
+        # Border
+        painter.setPen(QPen(GRID_COLOR, 1))
+        painter.drawRect(0, 0, w - 1, h - 1)
+
+        if len(self._history) < 2:
+            painter.setPen(TEXT_MUTED)
+            painter.setFont(QFont('Segoe UI', 9))
+            painter.drawText(QRectF(pad_l, pad_t, pw, ph), Qt.AlignCenter,
+                             'Waiting for speech...')
+            painter.end()
+            return
+
+        # SNR line
+        n = len(self._history)
+        path = QPainterPath()
+        for i, db in enumerate(self._history):
+            x = pad_l + pw * i / (self.MAX_POINTS - 1)
+            y = db_to_y(max(self.DB_MIN, min(self.DB_MAX, db)))
+            if i == 0:
+                path.moveTo(x, y)
+            else:
+                path.lineTo(x, y)
+
+        # Gradient stroke based on latest quality
+        latest = self._history[-1]
+        if latest >= 40:
+            line_color = QColor('#00E676')
+        elif latest >= 25:
+            line_color = QColor('#3FB950')
+        elif latest >= 15:
+            line_color = QColor('#E3B341')
+        elif latest >= 5:
+            line_color = QColor('#FF9800')
+        else:
+            line_color = QColor('#F44336')
+
+        painter.setPen(QPen(line_color, 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        painter.drawPath(path)
+
+        # Latest value dot + label
+        last_x = pad_l + pw * (n - 1) / (self.MAX_POINTS - 1)
+        last_y = db_to_y(max(self.DB_MIN, min(self.DB_MAX, latest)))
+        painter.setBrush(QBrush(line_color))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(QPointF(last_x, last_y), 4, 4)
+
+        painter.setPen(line_color)
+        painter.setFont(QFont('Consolas', 8, QFont.Bold))
+        painter.drawText(int(last_x) - 30, int(last_y) - 7, f'{latest:.1f} dB')
+
+        painter.end()
+
+
+# ──────────────────────────────────────────────
+#  VAD Status Bar Widget
+# ──────────────────────────────────────────────
+class VADStatusWidget(QWidget):
+    """
+    Small horizontal bar that lights up green (signal) or blue (noise)
+    to show what the VAD is currently classifying.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._is_signal = False
+        self._label = 'Waiting...'
+        self.setFixedHeight(28)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def set_state(self, is_signal: bool):
+        self._is_signal = is_signal
+        self._label = '🔴  SIGNAL detected' if is_signal else '🔵  Noise / silence'
+        self.update()
+
+    def set_idle(self):
+        self._label = 'Waiting...'
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+
+        color = ACCENT_GREEN if self._is_signal else ACCENT_BLUE
+        bg = QColor(color)
+        bg.setAlpha(40)
+        painter.fillRect(0, 0, w, h, bg)
+        painter.setPen(QPen(color, 1))
+        painter.drawRect(0, 0, w - 1, h - 1)
+
+        painter.setPen(color)
+        painter.setFont(QFont('Segoe UI', 9, QFont.Bold))
+        painter.drawText(QRectF(0, 0, w, h), Qt.AlignCenter, self._label)
+        painter.end()
