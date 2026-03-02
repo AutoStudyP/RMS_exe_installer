@@ -4,7 +4,7 @@ build-backend = "setuptools.backends.legacy:build"
 
 [project]
 name = "snr-meter"
-version = "0.0.0"
+version = "0.1.0"
 description = "Desktop SNR (Signal-to-Noise Ratio) analyzer with 2-stage microphone recording and real-time visualization"
 readme = "README.md"
 license = { text = "MIT" }

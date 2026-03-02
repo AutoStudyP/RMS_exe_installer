@@ -27,16 +27,19 @@ from PyQt5.QtWidgets import (
     QGridLayout,
     QTextEdit,
     QScrollArea,
+    QTabWidget,
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, QObject
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, QObject, pyqtSlot
 from PyQt5.QtGui import QColor, QFont, QPalette, QIcon
 
-from .audio_engine import AudioRecorder, AudioData, SNRResult
+from .audio_engine import AudioRecorder, AudioData, SNRResult, AutoVADRecorder
 from .widgets import (
     WaveformWidget,
     SpectrumWidget,
     SNRGaugeWidget,
     VUMeterWidget,
+    LiveSNRHistoryWidget,
+    VADStatusWidget,
     BG_DARK,
     BG_PANEL,
     BG_WIDGET,
@@ -205,12 +208,18 @@ def make_label(text, size=11, bold=False, color="#E6EDF3"):
 class SNRMeterWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        # Manual recorder
         self.recorder = AudioRecorder()
         self.state = AppState.IDLE
         self.signal_data: Optional[AudioData] = None
         self.noise_data: Optional[AudioData] = None
         self.snr_result: Optional[SNRResult] = None
         self._rec_elapsed = 0
+        # Auto VAD recorder
+        self.vad_recorder = AutoVADRecorder(
+            on_snr_update=self._on_vad_snr_update,
+            on_chunk=self._on_vad_chunk,
+        )
 
         self._setup_ui()
         self._setup_timers()
@@ -234,26 +243,34 @@ class SNRMeterWindow(QMainWindow):
         root_layout.addWidget(self._build_top_bar())
         root_layout.addWidget(make_separator())
 
-        # ── Main content splitter
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.setStyleSheet("QSplitter::handle { background: #30363D; width: 2px; }")
+        # ── Tab widget: Manual | Auto VAD
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet("""
+            QTabWidget::pane { border: 1px solid #30363D; border-radius:4px; }
+            QTabBar::tab {
+                background: #1C2128; color: #7D8590;
+                padding: 6px 20px; border-radius: 4px 4px 0 0;
+                font-size: 12px; font-weight: bold;
+            }
+            QTabBar::tab:selected { background: #0D1117; color: #E6EDF3; border-bottom: 2px solid #58A6FF; }
+            QTabBar::tab:hover    { background: #21262D; color: #E6EDF3; }
+        """)
 
-        # Left: controls + VU
-        left_panel = self._build_left_panel()
-        left_panel.setMaximumWidth(300)
-        splitter.addWidget(left_panel)
+        # Tab 1: Manual mode (existing flow)
+        manual_tab = self._build_manual_tab()
+        self.tabs.addTab(manual_tab, '🎙  Manual  (Signal + Noise)')
 
-        # Right: visualizations
-        splitter.addWidget(self._build_right_panel())
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        root_layout.addWidget(splitter, stretch=1)
+        # Tab 2: Auto VAD mode
+        auto_tab = self._build_auto_vad_tab()
+        self.tabs.addTab(auto_tab, '🤖  Auto  (VAD, just speak)')
+
+        root_layout.addWidget(self.tabs, stretch=1)
 
         # ── Status bar
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage(
-            "Ready — Select a microphone and record Signal first."
+            'Ready — Manual: record Signal then Noise.  Auto: just press Start and speak.'
         )
 
     def _build_top_bar(self):
@@ -283,127 +300,126 @@ class SNRMeterWindow(QMainWindow):
 
         return bar
 
-    def _build_left_panel(self):
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
+    def _build_manual_tab(self):
+        """Tab 1: existing 2-step manual recording UI."""
+        container = QWidget()
+        root = QHBoxLayout(container)
+        root.setContentsMargins(4, 4, 4, 4)
+        root.setSpacing(6)
+
+        # ── LEFT panel (controls)
+        left = QWidget()
+        left.setMaximumWidth(300)
+        left.setMinimumWidth(250)
+        layout = QVBoxLayout(left)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(10)
 
-        # ── Device Selection
-        dev_group = QGroupBox("Input Device")
+        # Device Selection
+        dev_group = QGroupBox('Input Device')
         dev_layout = QVBoxLayout(dev_group)
         self.combo_device = QComboBox()
         dev_layout.addWidget(self.combo_device)
-        btn_refresh = QPushButton("↻ Refresh")
-        btn_refresh.setObjectName("btn_reset")
+        btn_refresh = QPushButton('↻ Refresh')
+        btn_refresh.setObjectName('btn_reset')
         btn_refresh.setFixedHeight(28)
         btn_refresh.clicked.connect(self._refresh_devices)
         dev_layout.addWidget(btn_refresh)
         layout.addWidget(dev_group)
 
-        # ── Step 1: Record Signal
-        sig_group = QGroupBox("Step 1 — Signal Recording")
+        # Step 1: Record Signal
+        sig_group = QGroupBox('Step 1 — Signal Recording')
         sig_layout = QVBoxLayout(sig_group)
-        hint1 = make_label(
-            "Record your audio signal\n(voice, music, test tone...)", 9, color="#7D8590"
-        )
+        hint1 = make_label('Record your audio signal\n(voice, music, test tone...)', 9, color='#7D8590')
         hint1.setWordWrap(True)
         sig_layout.addWidget(hint1)
-        self.btn_signal = QPushButton("⏺  Record Signal")
-        self.btn_signal.setObjectName("btn_record_signal")
+        self.btn_signal = QPushButton('⏺  Record Signal')
+        self.btn_signal.setObjectName('btn_record_signal')
         self.btn_signal.setFixedHeight(44)
         self.btn_signal.clicked.connect(self._on_signal_clicked)
         sig_layout.addWidget(self.btn_signal)
-        self.lbl_signal_info = make_label("Not recorded", 9, color="#7D8590")
+        self.lbl_signal_info = make_label('Not recorded', 9, color='#7D8590')
         sig_layout.addWidget(self.lbl_signal_info)
         layout.addWidget(sig_group)
 
-        # ── Step 2: Record Noise
-        noise_group = QGroupBox("Step 2 — Noise Recording")
+        # Step 2: Record Noise
+        noise_group = QGroupBox('Step 2 — Noise Recording')
         noise_layout = QVBoxLayout(noise_group)
-        hint2 = make_label(
-            "Record background noise\n(room silence, fan hum...)", 9, color="#7D8590"
-        )
+        hint2 = make_label('Record background noise\n(room silence, fan hum...)', 9, color='#7D8590')
         hint2.setWordWrap(True)
         noise_layout.addWidget(hint2)
-        self.btn_noise = QPushButton("⏺  Record Noise")
-        self.btn_noise.setObjectName("btn_record_noise")
+        self.btn_noise = QPushButton('⏺  Record Noise')
+        self.btn_noise.setObjectName('btn_record_noise')
         self.btn_noise.setFixedHeight(44)
         self.btn_noise.clicked.connect(self._on_noise_clicked)
         noise_layout.addWidget(self.btn_noise)
-        self.lbl_noise_info = make_label("Not recorded", 9, color="#7D8590")
+        self.lbl_noise_info = make_label('Not recorded', 9, color='#7D8590')
         noise_layout.addWidget(self.lbl_noise_info)
         layout.addWidget(noise_group)
 
-        # ── Stop / Reset
+        # Stop / Reset
         ctrl_layout = QHBoxLayout()
-        self.btn_stop = QPushButton("⏹ Stop")
-        self.btn_stop.setObjectName("btn_stop")
+        self.btn_stop = QPushButton('⏹ Stop')
+        self.btn_stop.setObjectName('btn_stop')
         self.btn_stop.setFixedHeight(36)
         self.btn_stop.clicked.connect(self._on_stop_clicked)
         ctrl_layout.addWidget(self.btn_stop)
-
-        self.btn_reset = QPushButton("↺ Reset")
-        self.btn_reset.setObjectName("btn_reset")
+        self.btn_reset = QPushButton('↺ Reset')
+        self.btn_reset.setObjectName('btn_reset')
         self.btn_reset.setFixedHeight(36)
         self.btn_reset.clicked.connect(self._on_reset_clicked)
         ctrl_layout.addWidget(self.btn_reset)
         layout.addLayout(ctrl_layout)
 
-        # ── VU Meter
-        vu_group = QGroupBox("Live Level")
+        # VU Meter
+        vu_group = QGroupBox('Live Level')
         vu_layout = QHBoxLayout(vu_group)
         vu_layout.setContentsMargins(8, 8, 8, 8)
         self.vu_meter = VUMeterWidget()
         self.vu_meter.setMinimumHeight(100)
         vu_layout.addWidget(self.vu_meter)
-
         vu_labels = QVBoxLayout()
-        for db_text in ["0 dB", "-6", "-12", "-20", "-40", "-∞"]:
-            lbl = make_label(db_text, 7, color="#7D8590")
+        for db_text in ['0 dB', '-6', '-12', '-20', '-40', '-∞']:
+            lbl = make_label(db_text, 7, color='#7D8590')
             lbl.setAlignment(Qt.AlignRight)
             vu_labels.addWidget(lbl)
         vu_layout.addLayout(vu_labels)
         layout.addWidget(vu_group)
-
         layout.addStretch()
 
-        # ── Stats box
-        stats_group = QGroupBox("Measurements")
+        # Stats box
+        stats_group = QGroupBox('Measurements')
         stats_layout = QGridLayout(stats_group)
         stats_layout.setHorizontalSpacing(8)
         stats_layout.setVerticalSpacing(4)
-
         self._stat_labels = {}
         stat_keys = [
-            ("signal_rms", "Signal RMS"),
-            ("signal_peak", "Signal Peak"),
-            ("noise_rms", "Noise RMS"),
-            ("noise_peak", "Noise Peak"),
-            ("snr_db", "SNR"),
-            ("quality", "Quality"),
+            ('signal_rms',  'Signal RMS'),
+            ('signal_peak', 'Signal Peak'),
+            ('noise_rms',   'Noise RMS'),
+            ('noise_peak',  'Noise Peak'),
+            ('snr_db',      'SNR'),
+            ('quality',     'Quality'),
         ]
         for row, (key, display) in enumerate(stat_keys):
-            lbl_key = make_label(display + ":", 9, color="#7D8590")
-            lbl_val = make_label("—", 9, bold=True)
+            lbl_key = make_label(display + ':', 9, color='#7D8590')
+            lbl_val = make_label('—', 9, bold=True)
             stats_layout.addWidget(lbl_key, row, 0)
             stats_layout.addWidget(lbl_val, row, 1)
             self._stat_labels[key] = lbl_val
         layout.addWidget(stats_group)
 
-        return panel
+        root.addWidget(left)
+        root.addWidget(make_separator(vertical=True))
 
-    def _build_right_panel(self):
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(4, 0, 4, 0)
-        layout.setSpacing(8)
+        # ── RIGHT panel (visualizations)
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(4, 0, 4, 0)
+        rl.setSpacing(8)
 
-        # ── Top row: Gauge + Waveforms
         top_row = QHBoxLayout()
-
-        # SNR Gauge
-        gauge_group = QGroupBox("SNR Result")
+        gauge_group = QGroupBox('SNR Result')
         gauge_layout = QVBoxLayout(gauge_group)
         self.gauge = SNRGaugeWidget()
         self.gauge.setMinimumSize(220, 220)
@@ -411,32 +427,186 @@ class SNRMeterWindow(QMainWindow):
         gauge_group.setFixedWidth(280)
         top_row.addWidget(gauge_group)
 
-        # Waveforms (stacked)
-        wave_group = QGroupBox("Waveforms")
+        wave_group = QGroupBox('Waveforms')
         wave_layout = QVBoxLayout(wave_group)
-
-        wave_layout.addWidget(make_label("Signal", 9, color="#58A6FF"))
-        self.wave_signal = WaveformWidget(color=ACCENT_BLUE, label="SIGNAL")
+        wave_layout.addWidget(make_label('Signal', 9, color='#58A6FF'))
+        self.wave_signal = WaveformWidget(color=ACCENT_BLUE, label='SIGNAL')
         self.wave_signal.setMinimumHeight(90)
         wave_layout.addWidget(self.wave_signal)
-
-        wave_layout.addWidget(make_label("Noise", 9, color="#F85149"))
-        self.wave_noise = WaveformWidget(color=ACCENT_RED, label="NOISE")
+        wave_layout.addWidget(make_label('Noise', 9, color='#F85149'))
+        self.wave_noise = WaveformWidget(color=ACCENT_RED, label='NOISE')
         self.wave_noise.setMinimumHeight(90)
         wave_layout.addWidget(self.wave_noise)
-
         top_row.addWidget(wave_group, stretch=1)
-        layout.addLayout(top_row)
+        rl.addLayout(top_row)
 
-        # ── Bottom: Spectrum
-        spec_group = QGroupBox("Frequency Spectrum  (Blue = Signal  |  Red = Noise)")
+        spec_group = QGroupBox('Frequency Spectrum  (Blue = Signal  |  Red = Noise)')
         spec_layout = QVBoxLayout(spec_group)
         self.spectrum = SpectrumWidget()
         self.spectrum.setMinimumHeight(160)
         spec_layout.addWidget(self.spectrum)
-        layout.addWidget(spec_group, stretch=1)
+        rl.addWidget(spec_group, stretch=1)
 
-        return panel
+        root.addWidget(right, stretch=1)
+        return container
+
+    def _build_auto_vad_tab(self):
+        """Tab 2: single-button VAD auto mode."""
+        container = QWidget()
+        root = QHBoxLayout(container)
+        root.setContentsMargins(4, 4, 4, 4)
+        root.setSpacing(6)
+
+        # ── LEFT: controls
+        left = QWidget()
+        left.setMaximumWidth(300)
+        left.setMinimumWidth(250)
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(4, 4, 4, 4)
+        ll.setSpacing(10)
+
+        # Device (shared combo)
+        dev_g = QGroupBox('Input Device')
+        dev_ll = QVBoxLayout(dev_g)
+        self.combo_device_vad = QComboBox()
+        dev_ll.addWidget(self.combo_device_vad)
+        btn_ref2 = QPushButton('↻ Refresh')
+        btn_ref2.setObjectName('btn_reset')
+        btn_ref2.setFixedHeight(28)
+        btn_ref2.clicked.connect(self._refresh_devices)
+        dev_ll.addWidget(btn_ref2)
+        ll.addWidget(dev_g)
+
+        # How it works hint
+        hint_g = QGroupBox('How it works')
+        hint_ll = QVBoxLayout(hint_g)
+        hint = make_label(
+            '① Press Start\n'
+            '② Just speak normally — the app\n'
+            '   auto-detects speech vs silence\n'
+            '③ SNR updates live as you talk\n'
+            '④ Press Stop when done', 9, color='#7D8590')
+        hint.setWordWrap(True)
+        hint_ll.addWidget(hint)
+        ll.addWidget(hint_g)
+
+        # Sensitivity
+        sens_g = QGroupBox('VAD Sensitivity')
+        sens_ll = QVBoxLayout(sens_g)
+        sens_ll.addWidget(make_label('Speech threshold (x noise floor):', 9, color='#7D8590'))
+        self.combo_sensitivity = QComboBox()
+        self.combo_sensitivity.addItems(['Sensitive  (2×)', 'Normal  (3×)', 'Strict  (5×)'])
+        self.combo_sensitivity.setCurrentIndex(1)
+        self.combo_sensitivity.currentIndexChanged.connect(self._on_sensitivity_changed)
+        sens_ll.addWidget(self.combo_sensitivity)
+        ll.addWidget(sens_g)
+
+        # Start / Stop / Reset buttons
+        self.btn_vad_start = QPushButton('▶  Start Listening')
+        self.btn_vad_start.setObjectName('btn_record_signal')
+        self.btn_vad_start.setFixedHeight(48)
+        self.btn_vad_start.clicked.connect(self._on_vad_start)
+        ll.addWidget(self.btn_vad_start)
+
+        self.btn_vad_stop = QPushButton('⏹  Stop')
+        self.btn_vad_stop.setObjectName('btn_stop')
+        self.btn_vad_stop.setFixedHeight(36)
+        self.btn_vad_stop.setEnabled(False)
+        self.btn_vad_stop.clicked.connect(self._on_vad_stop)
+        ll.addWidget(self.btn_vad_stop)
+
+        self.btn_vad_reset = QPushButton('↺ Reset')
+        self.btn_vad_reset.setObjectName('btn_reset')
+        self.btn_vad_reset.setFixedHeight(36)
+        self.btn_vad_reset.clicked.connect(self._on_vad_reset)
+        ll.addWidget(self.btn_vad_reset)
+
+        # VU meter
+        vu_g = QGroupBox('Live Level')
+        vu_ll = QHBoxLayout(vu_g)
+        vu_ll.setContentsMargins(8, 8, 8, 8)
+        self.vu_meter_vad = VUMeterWidget()
+        self.vu_meter_vad.setMinimumHeight(100)
+        vu_ll.addWidget(self.vu_meter_vad)
+        vu_labels2 = QVBoxLayout()
+        for db_text in ['0 dB', '-6', '-12', '-20', '-40', '-∞']:
+            lbl = make_label(db_text, 7, color='#7D8590')
+            lbl.setAlignment(Qt.AlignRight)
+            vu_labels2.addWidget(lbl)
+        vu_ll.addLayout(vu_labels2)
+        ll.addWidget(vu_g)
+        ll.addStretch()
+
+        # Stats
+        stats_g = QGroupBox('Live Measurements')
+        stats_gl = QGridLayout(stats_g)
+        stats_gl.setHorizontalSpacing(8)
+        stats_gl.setVerticalSpacing(4)
+        self._vad_stat_labels = {}
+        vad_stat_keys = [
+            ('sig_frames',  'Signal frames'),
+            ('noi_frames',  'Noise frames'),
+            ('sig_dur',     'Signal duration'),
+            ('noi_dur',     'Noise duration'),
+            ('snr_db',      'SNR'),
+            ('quality',     'Quality'),
+        ]
+        for row, (key, display) in enumerate(vad_stat_keys):
+            lbl_key = make_label(display + ':', 9, color='#7D8590')
+            lbl_val = make_label('—', 9, bold=True)
+            stats_gl.addWidget(lbl_key, row, 0)
+            stats_gl.addWidget(lbl_val, row, 1)
+            self._vad_stat_labels[key] = lbl_val
+        ll.addWidget(stats_g)
+
+        root.addWidget(left)
+        root.addWidget(make_separator(vertical=True))
+
+        # ── RIGHT: visualizations
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(4, 0, 4, 0)
+        rl.setSpacing(8)
+
+        # Top row: gauge + live waveform
+        top_row = QHBoxLayout()
+
+        gauge_g = QGroupBox('SNR Result')
+        gauge_ll = QVBoxLayout(gauge_g)
+        self.vad_gauge = SNRGaugeWidget()
+        self.vad_gauge.setMinimumSize(220, 220)
+        gauge_ll.addWidget(self.vad_gauge)
+        gauge_g.setFixedWidth(280)
+        top_row.addWidget(gauge_g)
+
+        wave_g = QGroupBox('Live Waveform  (Green = speech / Blue = silence)')
+        wave_ll = QVBoxLayout(wave_g)
+        self.vad_status_bar = VADStatusWidget()
+        wave_ll.addWidget(self.vad_status_bar)
+        self.vad_wave = WaveformWidget(color=ACCENT_GREEN, label='LIVE')
+        self.vad_wave.setMinimumHeight(150)
+        wave_ll.addWidget(self.vad_wave, stretch=1)
+        top_row.addWidget(wave_g, stretch=1)
+        rl.addLayout(top_row)
+
+        # SNR history graph
+        hist_g = QGroupBox('SNR Over Time  (auto-updates every ~0.5s)')
+        hist_ll = QVBoxLayout(hist_g)
+        self.snr_history = LiveSNRHistoryWidget()
+        self.snr_history.setMinimumHeight(160)
+        hist_ll.addWidget(self.snr_history)
+        rl.addWidget(hist_g, stretch=1)
+
+        # Spectrum
+        spec_g = QGroupBox('Frequency Spectrum  (Blue = Signal  |  Red = Noise)')
+        spec_ll = QVBoxLayout(spec_g)
+        self.vad_spectrum = SpectrumWidget()
+        self.vad_spectrum.setMinimumHeight(130)
+        spec_ll.addWidget(self.vad_spectrum)
+        rl.addWidget(spec_g, stretch=1)
+
+        root.addWidget(right, stretch=1)
+        return container
 
     # ── Timers ────────────────────────────────
     def _setup_timers(self):
@@ -462,7 +632,6 @@ class SNRMeterWindow(QMainWindow):
             level = self.recorder.get_live_level()
             self.vu_meter.set_level(level)
             waveform = self.recorder.get_live_waveform()
-
             if self.state == AppState.REC_SIGNAL:
                 self.wave_signal.set_data(waveform)
             elif self.state == AppState.REC_NOISE:
@@ -470,17 +639,37 @@ class SNRMeterWindow(QMainWindow):
         else:
             self.vu_meter.set_level(0)
 
+    def _tick_vad_ui(self):
+        if not self.vad_recorder.is_running:
+            return
+        self.vu_meter_vad.set_level(self.vad_recorder.get_live_level())
+        waveform = self.vad_recorder.get_live_waveform()
+        is_sig = self.vad_recorder.last_block_is_signal
+        self.vad_wave.color = ACCENT_GREEN if is_sig else ACCENT_BLUE
+        self.vad_wave.set_data(waveform)
+        self.vad_status_bar.set_state(is_sig)
+        n_sig, n_noi = self.vad_recorder.get_frame_counts()
+        self._vad_stat_labels['sig_frames'].setText(str(n_sig))
+        self._vad_stat_labels['noi_frames'].setText(str(n_noi))
+        self._vad_stat_labels['sig_dur'].setText(f'{self.vad_recorder.get_signal_duration():.1f} s')
+        self._vad_stat_labels['noi_dur'].setText(f'{self.vad_recorder.get_noise_duration():.1f} s')
+
     # ── Device ────────────────────────────────
     def _refresh_devices(self):
-        self.combo_device.clear()
         devices = self.recorder.get_input_devices()
-        for dev in devices:
-            self.combo_device.addItem(f"[{dev['index']}] {dev['name']}", dev["index"])
-        if not devices:
-            self.combo_device.addItem("No input devices found", -1)
+        for combo in (self.combo_device, self.combo_device_vad):
+            combo.clear()
+            for dev in devices:
+                combo.addItem(f"[{dev['index']}] {dev['name']}", dev['index'])
+            if not devices:
+                combo.addItem('No input devices found', -1)
 
     def _get_selected_device(self) -> Optional[int]:
         idx = self.combo_device.currentData()
+        return idx if idx is not None and idx >= 0 else None
+
+    def _get_selected_device_vad(self) -> Optional[int]:
+        idx = self.combo_device_vad.currentData()
         return idx if idx is not None and idx >= 0 else None
 
     # ── State Machine ─────────────────────────
@@ -655,10 +844,85 @@ class SNRMeterWindow(QMainWindow):
             lbl.setText("—")
             lbl.setStyleSheet("color: #E6EDF3;")
 
+    # ── Auto VAD handlers ──────────────────────────────────────────
+    def _on_vad_start(self):
+        device = self._get_selected_device_vad()
+        self.vad_recorder.start(device_index=device)
+        self._vad_ui_timer.start()
+        self.btn_vad_start.setEnabled(False)
+        self.btn_vad_stop.setEnabled(True)
+        self.vad_status_bar.set_idle()
+        self.status_bar.showMessage('Auto VAD: listening... speak normally. Quiet moments = Noise.')
+
+    def _on_vad_stop(self):
+        self.vad_recorder.stop()
+        self._vad_ui_timer.stop()
+        self.vu_meter_vad.set_level(0)
+        self.btn_vad_start.setEnabled(True)
+        self.btn_vad_stop.setEnabled(False)
+        self.vad_status_bar.set_idle()
+        r = self.vad_recorder.last_snr
+        if r:
+            self.status_bar.showMessage(
+                f'Done — Final SNR: {r.snr_db:.1f} dB  ({r.quality_label})'
+            )
+        else:
+            self.status_bar.showMessage('Stopped. Not enough data for SNR calculation.')
+
+    def _on_vad_reset(self):
+        was_running = self.vad_recorder.is_running
+        self.vad_recorder.reset()
+        self.snr_history.clear()
+        self.vad_gauge.clear()
+        self.vad_wave.clear()
+        self.vad_spectrum.clear()
+        self.vad_status_bar.set_idle()
+        for lbl in self._vad_stat_labels.values():
+            lbl.setText('—')
+            lbl.setStyleSheet('color: #E6EDF3;')
+        if not was_running:
+            self.status_bar.showMessage('VAD reset.')
+
+    def _on_sensitivity_changed(self, idx: int):
+        ratios = [2.0, 3.0, 5.0]
+        self.vad_recorder.SPEECH_RATIO = ratios[idx]
+
+    def _on_vad_snr_update(self, result, sig_samples, noi_samples):
+        """Called from audio thread — schedule GUI update on main thread."""
+        QTimer.singleShot(0, lambda: self._apply_vad_result(result, sig_samples, noi_samples))
+
+    def _apply_vad_result(self, result, sig_samples, noi_samples):
+        snr   = result.snr_db
+        label = result.quality_label
+        color = result.quality_color
+        self.vad_gauge.set_result(snr, label, color)
+        self.snr_history.push_snr(snr)
+        from .audio_engine import AudioData, SAMPLE_RATE
+        sig_data = AudioData(sig_samples, SAMPLE_RATE, 'signal')
+        noi_data  = AudioData(noi_samples, SAMPLE_RATE, 'noise')
+        freqs_s, db_s = sig_data.get_spectrum(n_fft=4096)
+        freqs_n, db_n = noi_data.get_spectrum(n_fft=4096)
+        self.vad_spectrum.set_signal(freqs_s, db_s)
+        self.vad_spectrum.set_noise(freqs_n, db_n)
+        quality_colors = {
+            'Excellent': '#00E676', 'Good': '#69F0AE',
+            'Acceptable': '#FFEB3B', 'Poor': '#FF9800', 'Very Poor': '#F44336',
+        }
+        self._vad_stat_labels['snr_db'].setText(f'{snr:.2f} dB')
+        self._vad_stat_labels['snr_db'].setStyleSheet('color: #E3B341; font-weight: bold;')
+        self._vad_stat_labels['quality'].setText(label)
+        c = quality_colors.get(label, '#E6EDF3')
+        self._vad_stat_labels['quality'].setStyleSheet(f'color: {c}; font-weight: bold;')
+
+    def _on_vad_chunk(self, chunk: np.ndarray, is_signal: bool):
+        pass  # UI updates handled by _tick_vad_ui timer
     def closeEvent(self, event):
         if self.recorder.is_recording:
-            self.recorder.stop("close")
+            self.recorder.stop('close')
+        if self.vad_recorder.is_running:
+            self.vad_recorder.stop()
         self._ui_timer.stop()
+        self._vad_ui_timer.stop()
         self._elapsed_timer.stop()
         event.accept()
 
