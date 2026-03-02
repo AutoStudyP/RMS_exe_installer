@@ -29,7 +29,7 @@ from PyQt5.QtWidgets import (
     QScrollArea,
     QTabWidget,
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, QObject, pyqtSlot
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, QObject
 from PyQt5.QtGui import QColor, QFont, QPalette, QIcon
 
 from .audio_engine import AudioRecorder, AudioData, SNRResult, AutoVADRecorder
@@ -216,10 +216,7 @@ class SNRMeterWindow(QMainWindow):
         self.snr_result: Optional[SNRResult] = None
         self._rec_elapsed = 0
         # Auto VAD recorder
-        self.vad_recorder = AutoVADRecorder(
-            on_snr_update=self._on_vad_snr_update,
-            on_chunk=self._on_vad_chunk,
-        )
+        self.vad_recorder = AutoVADRecorder()
 
         self._setup_ui()
         self._setup_timers()
@@ -642,17 +639,24 @@ class SNRMeterWindow(QMainWindow):
     def _tick_vad_ui(self):
         if not self.vad_recorder.is_running:
             return
+        # VU meter
         self.vu_meter_vad.set_level(self.vad_recorder.get_live_level())
+        # Live waveform
         waveform = self.vad_recorder.get_live_waveform()
-        is_sig = self.vad_recorder.last_block_is_signal
+        is_sig   = self.vad_recorder.get_is_signal()
         self.vad_wave.color = ACCENT_GREEN if is_sig else ACCENT_BLUE
         self.vad_wave.set_data(waveform)
         self.vad_status_bar.set_state(is_sig)
+        # Frame counts
         n_sig, n_noi = self.vad_recorder.get_frame_counts()
         self._vad_stat_labels['sig_frames'].setText(str(n_sig))
         self._vad_stat_labels['noi_frames'].setText(str(n_noi))
         self._vad_stat_labels['sig_dur'].setText(f'{self.vad_recorder.get_signal_duration():.1f} s')
         self._vad_stat_labels['noi_dur'].setText(f'{self.vad_recorder.get_noise_duration():.1f} s')
+        # Poll for new SNR result (safe — lock-protected, no Qt in audio thread)
+        new_result = self.vad_recorder.poll_snr()
+        if new_result is not None:
+            self._apply_vad_result(new_result)
 
     # ── Device ────────────────────────────────
     def _refresh_devices(self):
@@ -887,19 +891,17 @@ class SNRMeterWindow(QMainWindow):
         ratios = [2.0, 3.0, 5.0]
         self.vad_recorder.SPEECH_RATIO = ratios[idx]
 
-    def _on_vad_snr_update(self, result, sig_samples, noi_samples):
-        """Called from audio thread — schedule GUI update on main thread."""
-        QTimer.singleShot(0, lambda: self._apply_vad_result(result, sig_samples, noi_samples))
+    def _on_vad_snr_update_UNUSED(self):
+        pass  # kept for reference; polling is done in _tick_vad_ui
 
-    def _apply_vad_result(self, result, sig_samples, noi_samples):
+    def _apply_vad_result(self, result):
         snr   = result.snr_db
         label = result.quality_label
         color = result.quality_color
         self.vad_gauge.set_result(snr, label, color)
         self.snr_history.push_snr(snr)
-        from .audio_engine import AudioData, SAMPLE_RATE
-        sig_data = AudioData(sig_samples, SAMPLE_RATE, 'signal')
-        noi_data  = AudioData(noi_samples, SAMPLE_RATE, 'noise')
+        sig_data = result.signal
+        noi_data = result.noise
         freqs_s, db_s = sig_data.get_spectrum(n_fft=4096)
         freqs_n, db_n = noi_data.get_spectrum(n_fft=4096)
         self.vad_spectrum.set_signal(freqs_s, db_s)
@@ -914,8 +916,6 @@ class SNRMeterWindow(QMainWindow):
         c = quality_colors.get(label, '#E6EDF3')
         self._vad_stat_labels['quality'].setStyleSheet(f'color: {c}; font-weight: bold;')
 
-    def _on_vad_chunk(self, chunk: np.ndarray, is_signal: bool):
-        pass  # UI updates handled by _tick_vad_ui timer
     def closeEvent(self, event):
         if self.recorder.is_recording:
             self.recorder.stop('close')
